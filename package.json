@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-gateway",
+  "version": "1.0.0",
+  "description": "QR-login WhatsApp gateway with REST API (Baileys)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.0",
+    "@hapi/boom": "^10.0.1",
+    "express": "^4.19.2",
+    "pino": "^9.0.0",
+    "qrcode": "^1.5.3"
+  }
+}
