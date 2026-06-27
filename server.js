@@ -13,6 +13,7 @@ const { Boom } = require('@hapi/boom');
 const NodeCache = require('node-cache');
 const qrcode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
@@ -167,6 +168,12 @@ app.get('/', qrAuth, async (req, res) => {
   h += '<p style="font-size:15px">Sent: <b>' + sentCount + '</b> | Failed: <b>' + failCount +
        '</b> | Queue: <b>' + _queue.length + '</b> | Connected: <b>' +
        liveAccounts().length + '/' + accounts.length + '</b></p>';
+  h += '<p><a href="/" style="display:inline-block;background:#444;color:#fff;padding:8px 18px;border-radius:8px;text-decoration:none">🔄 Refresh</a></p>';
+  h += '<form action="/sendtest" method="get" style="margin:14px auto;padding:14px;border:1px dashed #888;border-radius:10px;display:inline-block">' +
+       '<b>Test bhejo (delivery check):</b><br>' +
+       '<input name="number" placeholder="10-digit number" style="padding:8px;font-size:15px;margin:8px 4px;width:170px" />' +
+       '<button type="submit" style="padding:8px 16px;font-size:15px;background:#1a7a40;color:#fff;border:none;border-radius:6px;cursor:pointer">Send Test</button>' +
+       '<br><small style="color:#888">Message bhejega + batayega DELIVERED hua ya nahi</small></form>';
   h += '<div style="display:flex;flex-wrap:wrap;gap:18px;justify-content:center;margin-top:16px">';
   for (const acc of accounts) {
     h += '<div style="border:1px solid #bbb;border-radius:12px;padding:16px;min-width:250px">';
@@ -179,6 +186,7 @@ app.get('/', qrAuth, async (req, res) => {
     } else {
       h += '<p style="color:#999">Starting / waiting...</p>';
     }
+    h += '<p><a href="/relogin/' + acc.id + '" onclick="return confirm(\'' + acc.id + ' ka login hatao aur naya QR lao?\')" style="font-size:12px;color:#c00;text-decoration:none">🔁 Re-login (naya QR)</a></p>';
     h += '</div>';
   }
   h += '</div><p style="color:#888;font-size:12px;margin-top:18px">Har 10s me refresh. Jitne number scan karoge utne se rotate hoga.</p>';
@@ -215,6 +223,74 @@ app.post('/api/send', (req, res) => {
   _processQueue();
 
   return res.json({ success: true, to: number, queued: true });
+});
+
+// ── result page helper ──
+function resultPage(msg) {
+  return '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Result</title></head><body style="font-family:sans-serif;text-align:center;padding:40px">' +
+    '<div style="font-size:18px;line-height:1.6;max-width:520px;margin:0 auto">' + msg + '</div>' +
+    '<p style="margin-top:24px"><a href="/" style="background:#444;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none">← Wapas</a></p>' +
+    '</body></html>';
+}
+
+// ── ACK ka wait (delivery confirm hone tak, max timeout) ──
+function waitForAck(acc, msgId, timeoutMs) {
+  return new Promise(function (resolve) {
+    var best = 1, done = false;
+    function handler(updates) {
+      for (var i = 0; i < updates.length; i++) {
+        var u = updates[i];
+        if (u.key && u.key.id === msgId && u.update && u.update.status != null) {
+          if (u.update.status > best) best = u.update.status;
+          if (u.update.status >= 3 && !done) { done = true; acc.sock.ev.off('messages.update', handler); resolve(best); }
+        }
+      }
+    }
+    acc.sock.ev.on('messages.update', handler);
+    setTimeout(function () { if (!done) { done = true; acc.sock.ev.off('messages.update', handler); resolve(best); } }, timeoutMs);
+  });
+}
+
+// ── Web se test bhejo + delivery status batao ──
+app.get('/sendtest', qrAuth, async (req, res) => {
+  var number = String(req.query.number || '').replace(/[^0-9]/g, '');
+  if (number.length === 10) number = '91' + number;
+  if (!number) return res.send(resultPage('❌ Number nahi diya.'));
+  var live = liveAccounts();
+  if (!live.length) return res.send(resultPage('❌ Koi account connected nahi.'));
+  var acc = live[rrIndex % live.length]; rrIndex++;
+  var jid = number + '@s.whatsapp.net';
+  var r;
+  try {
+    r = await acc.sock.sendMessage(jid, { text: '✅ Gateway test — ' + new Date().toLocaleString('hi-IN') });
+  } catch (e) { return res.send(resultPage('❌ Send error: ' + e.message + '<br>via ' + acc.id)); }
+  var msgId = r && r.key && r.key.id;
+  if (!msgId) return res.send(resultPage('❌ Send fail (no message id) via ' + acc.id));
+  acc.sentStore.set(msgId, { conversation: 'test' });
+  var status = await waitForAck(acc, msgId, 12000);
+  var v;
+  if (status >= 3) {
+    v = '✅ <b style="color:green">DELIVERED!</b> (2 tick)<br>Message <b>' + number + '</b> tak pahunch gaya.<br><br>Bheja via: <b>' + acc.id + ' (' + acc.number + ')</b>';
+  } else if (status === 2) {
+    v = '⚠️ <b style="color:#c60">SENT par DELIVER NAHI hua</b> (sirf 1 tick — 12s wait kiya)<br>Message <b>' + number + '</b> tak nahi pahuncha.<br><br>Iska matlab: encryption/recipient session issue (ya recipient ka phone abhi offline).<br>Bheja via: <b>' + acc.id + ' (' + acc.number + ')</b>';
+  } else {
+    v = '❌ <b style="color:#c00">Koi delivery confirm nahi mili</b> (status ' + status + ')<br>via ' + acc.id + ' (' + acc.number + ')';
+  }
+  res.send(resultPage(v));
+});
+
+// ── Account re-login: auth hatao, naya QR lao ──
+app.get('/relogin/:id', qrAuth, async (req, res) => {
+  var acc = accounts.find(function (a) { return a.id === req.params.id; });
+  if (!acc) return res.send(resultPage('❌ Account nahi mila.'));
+  try {
+    if (acc.sock) { try { acc.sock.end(); } catch (e) {} }
+    acc.connected = false; acc.qr = null; acc.number = '?';
+    try { fs.rmSync(acc.folder, { recursive: true, force: true }); } catch (e) {}
+    setTimeout(function () { startAccount(acc); }, 1500);
+    res.send(resultPage('🔁 ' + acc.id + ' reset ho gaya.<br>Kuch second me naya QR aayega — page par wapas jaa ke scan karo.'));
+  } catch (e) { res.send(resultPage('❌ Error: ' + e.message)); }
 });
 
 app.listen(PORT, function () {
