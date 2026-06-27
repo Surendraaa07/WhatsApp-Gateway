@@ -17,26 +17,38 @@ const fs = require('fs');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 const API_KEY = process.env.API_KEY || 'change-this-secret-key-123';
 const PORT = process.env.PORT || 3000;
 const SEND_GAP_MS = 5000;               // har message ke beech gap
 const NUM_ACCOUNTS = parseInt(process.env.NUM_ACCOUNTS || '3', 10);
 
-// ── QR page password ──
+// ── Login (proper page + cookie session, browser popup nahi) ──
+const crypto = require('crypto');
 const QR_USER = process.env.QR_USER || 'admin';
 const QR_PASS = process.env.QR_PASS || API_KEY;
-function qrAuth(req, res, next) {
-  const hdr = req.headers.authorization || '';
-  const sp = hdr.indexOf(' ');
-  const scheme = hdr.slice(0, sp), encoded = hdr.slice(sp + 1);
-  if (scheme === 'Basic' && encoded) {
-    const dec = Buffer.from(encoded, 'base64').toString();
-    const ci = dec.indexOf(':');
-    if (dec.slice(0, ci) === QR_USER && dec.slice(ci + 1) === QR_PASS) return next();
-  }
-  res.set('WWW-Authenticate', 'Basic realm="WhatsApp Gateway"');
-  return res.status(401).send('Authentication required');
+const SESSION_TOKEN = crypto.createHash('sha256').update('gw-session-' + QR_USER + ':' + QR_PASS).digest('hex').slice(0, 40);
+
+function parseCookies(req) {
+  const out = {}; const h = req.headers.cookie || '';
+  h.split(';').forEach(function (p) { const i = p.indexOf('='); if (i > 0) out[p.slice(0, i).trim()] = p.slice(i + 1).trim(); });
+  return out;
+}
+function requireLogin(req, res, next) {
+  if (parseCookies(req).gw_auth === SESSION_TOKEN) return next();
+  return res.redirect('/login');
+}
+function loginPage(err) {
+  return '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Login — WA Gateway</title></head>' +
+    '<body style="font-family:sans-serif;background:#0e1525;color:#fff;display:flex;align-items:center;justify-content:center;min-height:90vh;margin:0">' +
+    '<form method="post" action="/login" style="background:#1a2438;padding:30px;border-radius:14px;width:300px;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,.4)">' +
+    '<h2 style="margin-top:0">🔐 Gateway Login</h2>' +
+    (err ? '<p style="color:#ff6b6b;font-size:14px">' + err + '</p>' : '') +
+    '<input name="username" placeholder="Username" autocomplete="username" style="width:100%;box-sizing:border-box;padding:11px;margin:8px 0;border-radius:8px;border:1px solid #345;background:#0e1525;color:#fff" />' +
+    '<input name="password" type="password" placeholder="Password" autocomplete="current-password" style="width:100%;box-sizing:border-box;padding:11px;margin:8px 0;border-radius:8px;border:1px solid #345;background:#0e1525;color:#fff" />' +
+    '<button type="submit" style="width:100%;padding:12px;margin-top:10px;background:#1a7a40;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer">Login</button>' +
+    '</form></body></html>';
 }
 
 // ── accounts setup ──
@@ -170,12 +182,12 @@ async function _processQueue() {
 }
 
 // ── home page: saare accounts + QR ──
-app.get('/', qrAuth, async (req, res) => {
+app.get('/', requireLogin, async (req, res) => {
   let h = '<h1>WhatsApp Gateway — Multi Account</h1>';
   h += '<p style="font-size:15px">Sent: <b>' + sentCount + '</b> | Failed: <b>' + failCount +
        '</b> | Queue: <b>' + _queue.length + '</b> | Connected: <b>' +
        liveAccounts().length + '/' + accounts.length + '</b></p>';
-  h += '<p><a href="/" style="display:inline-block;background:#444;color:#fff;padding:8px 18px;border-radius:8px;text-decoration:none">🔄 Refresh</a></p>';
+  h += '<p><a href="/" style="display:inline-block;background:#444;color:#fff;padding:8px 18px;border-radius:8px;text-decoration:none">🔄 Refresh</a> &nbsp; <a href="/logout" style="display:inline-block;background:#a33;color:#fff;padding:8px 18px;border-radius:8px;text-decoration:none">🚪 Logout</a></p>';
   h += '<form action="/sendtest" method="get" style="margin:14px auto;padding:14px;border:1px dashed #888;border-radius:10px;display:inline-block">' +
        '<b>Test bhejo (delivery check):</b><br>' +
        '<input name="number" placeholder="10-digit number" style="padding:8px;font-size:15px;margin:8px 4px;width:170px" />' +
@@ -260,7 +272,7 @@ function waitForAck(acc, msgId, timeoutMs) {
 }
 
 // ── Web se test bhejo + delivery status batao ──
-app.get('/sendtest', qrAuth, async (req, res) => {
+app.get('/sendtest', requireLogin, async (req, res) => {
   var number = String(req.query.number || '').replace(/[^0-9]/g, '');
   if (number.length === 10) number = '91' + number;
   if (!number) return res.send(resultPage('❌ Number nahi diya.'));
@@ -288,7 +300,7 @@ app.get('/sendtest', qrAuth, async (req, res) => {
 });
 
 // ── Account re-login: auth hatao, naya QR lao ──
-app.get('/relogin/:id', qrAuth, async (req, res) => {
+app.get('/relogin/:id', requireLogin, async (req, res) => {
   var acc = accounts.find(function (a) { return a.id === req.params.id; });
   if (!acc) return res.send(resultPage('❌ Account nahi mila.'));
   try {
@@ -298,6 +310,25 @@ app.get('/relogin/:id', qrAuth, async (req, res) => {
     setTimeout(function () { startAccount(acc); }, 1500);
     res.send(resultPage('🔁 ' + acc.id + ' reset ho gaya.<br>Kuch second me naya QR aayega — page par wapas jaa ke scan karo.'));
   } catch (e) { res.send(resultPage('❌ Error: ' + e.message)); }
+});
+
+// ── Login / Logout routes ──
+app.get('/login', (req, res) => {
+  if (parseCookies(req).gw_auth === SESSION_TOKEN) return res.redirect('/');
+  res.send(loginPage(''));
+});
+app.post('/login', (req, res) => {
+  const u = (req.body && req.body.username) || '';
+  const p = (req.body && req.body.password) || '';
+  if (u === QR_USER && p === QR_PASS) {
+    res.setHeader('Set-Cookie', 'gw_auth=' + SESSION_TOKEN + '; HttpOnly; Path=/; Max-Age=2592000; SameSite=Lax');
+    return res.redirect('/');
+  }
+  res.send(loginPage('❌ Galat username ya password'));
+});
+app.get('/logout', (req, res) => {
+  res.setHeader('Set-Cookie', 'gw_auth=; HttpOnly; Path=/; Max-Age=0');
+  res.redirect('/login');
 });
 
 app.listen(PORT, function () {
