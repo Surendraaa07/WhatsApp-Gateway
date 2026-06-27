@@ -1,5 +1,6 @@
-// WhatsApp Gateway - QR login + REST API + 5s queue + counters
-// Reliability fixes: getMessage store, msgRetryCounter cache, keepalive, presence.
+// WhatsApp Gateway — MULTI ACCOUNT (2-3 numbers, rotation + failover)
+// Har message alag number se rotate hota hai → load spread + alag sessions.
+// acc1 = existing auth_session (purana 9927 login bachega), acc2/acc3 = naye.
 
 const express = require('express');
 const {
@@ -18,10 +19,10 @@ app.use(express.json());
 
 const API_KEY = process.env.API_KEY || 'change-this-secret-key-123';
 const PORT = process.env.PORT || 3000;
-const AUTH_FOLDER = process.env.AUTH_FOLDER || 'auth_session';
-const SEND_GAP_MS = 5000; // har message ke beech 5 second (anti-ban)
+const SEND_GAP_MS = 5000;               // har message ke beech gap
+const NUM_ACCOUNTS = parseInt(process.env.NUM_ACCOUNTS || '3', 10);
 
-// ── QR/home page protection: browser me kholne par password ──
+// ── QR page password ──
 const QR_USER = process.env.QR_USER || 'admin';
 const QR_PASS = process.env.QR_PASS || API_KEY;
 function qrAuth(req, res, next) {
@@ -37,170 +38,171 @@ function qrAuth(req, res, next) {
   return res.status(401).send('Authentication required');
 }
 
-let sock;
-let currentQR = null;
-let isConnected = false;
-
-let sentCount = 0;
-let failCount = 0;
-
-// ── reliability caches ──
-const msgRetryCounterCache = new NodeCache();      // message retry counts
-const sentMsgStore = new Map();                    // getMessage ke liye bheje hue messages
-
-// ── Message queue: 5s gap ──
-let _queue = [];
-let _processing = false;
-
-async function _processQueue() {
-  if (_processing) return;
-  _processing = true;
-  while (_queue.length) {
-    const job = _queue.shift();
-    try {
-      if (!isConnected) throw new Error('not connected');
-      const jid = job.number + '@s.whatsapp.net';
-      const [chk] = await sock.onWhatsApp(jid).catch(() => [null]);
-      if (chk && chk.exists === false) {
-        failCount++;
-        console.log('SKIP (not on WhatsApp): ' + job.number);
-      } else {
-        const sent = await sock.sendMessage(jid, { text: job.message });
-        // store for retry/getMessage
-        if (sent && sent.key && sent.key.id) {
-          sentMsgStore.set(sent.key.id, { conversation: job.message });
-          if (sentMsgStore.size > 300) { // purane saaf karo
-            const firstKey = sentMsgStore.keys().next().value;
-            sentMsgStore.delete(firstKey);
-          }
-        }
-        sentCount++;
-        console.log('SENT -> ' + job.number + ' | queue left: ' + _queue.length);
-      }
-    } catch (e) {
-      failCount++;
-      console.log('FAIL -> ' + job.number + ' | ' + e.message);
-    }
-    if (_queue.length) await new Promise(function (r) { setTimeout(r, SEND_GAP_MS); });
-  }
-  _processing = false;
+// ── accounts setup ──
+const accounts = [];
+for (let i = 1; i <= NUM_ACCOUNTS; i++) {
+  accounts.push({
+    id: 'acc' + i,
+    folder: i === 1 ? 'auth_session' : ('auth_acc' + i), // acc1 = purana login
+    sock: null,
+    connected: false,
+    qr: null,
+    number: '?',
+    retryCache: new NodeCache(),
+    sentStore: new Map(),
+  });
 }
 
-async function startWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+let sentCount = 0, failCount = 0;
+let _queue = [], _processing = false;
+let rrIndex = 0;
+
+function liveAccounts() { return accounts.filter(function (a) { return a.connected; }); }
+function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+async function startAccount(acc) {
+  const { state, saveCreds } = await useMultiFileAuthState(acc.folder);
   const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
+  const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
-    browser: ['MyDigitalRegister', 'Chrome', '1.0.0'],
-    // ── reliability settings (search-recommended) ──
-    msgRetryCounterCache,
-    markOnlineOnConnect: false,        // phone par notification aate rahein
-    keepAliveIntervalMs: 30000,        // connection zinda rakho
+    browser: ['MDR-' + acc.id, 'Chrome', '1.0.0'],
+    msgRetryCounterCache: acc.retryCache,
+    markOnlineOnConnect: false,
+    keepAliveIntervalMs: 30000,
     connectTimeoutMs: 60000,
     defaultQueryTimeoutMs: 60000,
     retryRequestDelayMs: 1000,
     maxMsgRetryCount: 5,
-    enableAutoSessionRecreation: true,   // tooti session khud banao (sent-but-not-delivered fix)
+    enableAutoSessionRecreation: true,
     syncFullHistory: false,
-    getMessage: async (key) => {       // retry/re-send ke liye zaroori
-      if (key && key.id && sentMsgStore.has(key.id)) return sentMsgStore.get(key.id);
+    getMessage: async (key) => {
+      if (key && key.id && acc.sentStore.has(key.id)) return acc.sentStore.get(key.id);
       return { conversation: '' };
     },
   });
+  acc.sock = sock;
 
   sock.ev.on('creds.update', saveCreds);
 
-  // ── ACK logging: message "sent" par atka ya "delivered" hua, terminal me dikhega ──
   sock.ev.on('messages.update', (updates) => {
     for (const u of updates) {
       const st = u.update && u.update.status;
       if (st != null) {
-        const map = { 1: 'PENDING', 2: 'SENT (1 tick)', 3: 'DELIVERED (2 tick)', 4: 'READ', 5: 'PLAYED' };
+        const map = { 1: 'PENDING', 2: 'SENT(1tick)', 3: 'DELIVERED(2tick)', 4: 'READ', 5: 'PLAYED' };
         const who = (u.key && u.key.remoteJid) ? u.key.remoteJid.split('@')[0] : '?';
-        console.log('ACK: ' + who + ' -> status ' + st + ' = ' + (map[st] || 'unknown'));
+        console.log('[' + acc.id + '] ACK ' + who + ' -> ' + st + '=' + (map[st] || '?'));
       }
-    }
-  });
-  sock.ev.on('message-receipt.update', (receipts) => {
-    for (const r of receipts) {
-      const who = (r.key && r.key.remoteJid) ? r.key.remoteJid.split('@')[0] : '?';
-      const t = r.receipt && (r.receipt.receiptTimestamp || r.receipt.readTimestamp) ? 'received' : 'receipt';
-      console.log('RECEIPT: ' + who + ' -> ' + t);
     }
   });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
-    if (qr) { currentQR = qr; isConnected = false; }
+    if (qr) { acc.qr = qr; acc.connected = false; }
     if (connection === 'open') {
-      isConnected = true; currentQR = null;
-      var me = (sock.user && sock.user.id) ? sock.user.id.split(':')[0].split('@')[0] : '?';
-      console.log('WhatsApp connected and ready.');
-      console.log('================================================');
-      console.log('  PAIRED NUMBER (messages is number se jaayenge): ' + me);
-      console.log('================================================');
-      // online presence bhejo taaki messages flow karein
+      acc.connected = true; acc.qr = null;
+      acc.number = (sock.user && sock.user.id) ? sock.user.id.split(':')[0].split('@')[0] : '?';
+      console.log('[' + acc.id + '] CONNECTED as ' + acc.number);
       try { sock.sendPresenceUpdate('available'); } catch (e) {}
     }
     if (connection === 'close') {
-      isConnected = false;
+      acc.connected = false;
       const code = lastDisconnect && lastDisconnect.error instanceof Boom
         ? lastDisconnect.error.output.statusCode : null;
       const loggedOut = code === DisconnectReason.loggedOut;
-      console.log('Connection closed. code=' + code + ' reconnect=' + !loggedOut);
-      if (!loggedOut) setTimeout(startWhatsApp, 3000);
-      else console.log('Logged out. Delete the ' + AUTH_FOLDER + ' folder and re-scan QR.');
+      console.log('[' + acc.id + '] closed. code=' + code + ' reconnect=' + !loggedOut);
+      if (!loggedOut) setTimeout(function () { startAccount(acc); }, 3000);
+      else console.log('[' + acc.id + '] logged out. Delete folder "' + acc.folder + '" & re-scan.');
     }
   });
 }
 
-startWhatsApp();
+// start all accounts
+accounts.forEach(function (acc) { startAccount(acc); });
 
-// ── Home / QR / status page ──
-app.get('/', qrAuth, async (req, res) => {
-  const stats = '<p style="color:#444;font-size:15px">📤 Sent: <b>' + sentCount +
-    '</b> &nbsp;|&nbsp; ❌ Failed: <b>' + failCount +
-    '</b> &nbsp;|&nbsp; ⏳ Queue: <b>' + _queue.length + '</b></p>';
-  if (isConnected) {
-    return res.send(page('<h2>✅ WhatsApp Connected & Ready</h2>' + stats +
-      '<script>setTimeout(function(){location.reload()},15000)</script>'));
+// ── queue: rotation + failover ──
+async function _processQueue() {
+  if (_processing) return;
+  _processing = true;
+  while (_queue.length) {
+    const job = _queue.shift();
+    const live = liveAccounts();
+    if (!live.length) {
+      failCount++; console.log('FAIL (no account connected) -> ' + job.number);
+      if (_queue.length) await delay(SEND_GAP_MS);
+      continue;
+    }
+    let sent = false;
+    // rrIndex se shuru, har account try karo jab tak ek success na ho (failover)
+    for (let k = 0; k < live.length && !sent; k++) {
+      const acc = live[(rrIndex + k) % live.length];
+      try {
+        const jid = job.number + '@s.whatsapp.net';
+        const r = await acc.sock.sendMessage(jid, { text: job.message });
+        if (r && r.key && r.key.id) {
+          acc.sentStore.set(r.key.id, { conversation: job.message });
+          if (acc.sentStore.size > 300) {
+            const fk = acc.sentStore.keys().next().value; acc.sentStore.delete(fk);
+          }
+        }
+        sent = true; sentCount++;
+        console.log('SENT via ' + acc.id + '(' + acc.number + ') -> ' + job.number + ' | queue:' + _queue.length);
+      } catch (e) {
+        console.log('FAIL via ' + acc.id + ' -> ' + job.number + ' | ' + e.message + ' (next try)');
+      }
+    }
+    if (!sent) { failCount++; console.log('FAIL (all accounts) -> ' + job.number); }
+    rrIndex++; // agla message agle account se shuru
+    if (_queue.length) await delay(SEND_GAP_MS);
   }
-  if (currentQR) {
-    const img = await qrcode.toDataURL(currentQR);
-    return res.send(page(
-      '<h2>Scan with WhatsApp</h2>' +
-      '<p>WhatsApp → Linked Devices → Link a Device</p>' +
-      '<img src="' + img + '" style="width:300px;height:300px"/>' +
-      '<p><small>Page har 10s me refresh hoga</small></p>' +
-      '<script>setTimeout(function(){location.reload()},10000)</script>'
-    ));
-  }
-  return res.send(page('<h2>Starting...</h2><p>Thodi der me refresh hoga</p>' +
-    '<script>setTimeout(function(){location.reload()},3000)</script>'));
-});
-
-function page(inner) {
-  return '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">' +
-    '<title>WhatsApp Gateway</title></head>' +
-    '<body style="font-family:sans-serif;text-align:center;padding:40px">' + inner + '</body></html>';
+  _processing = false;
 }
 
-// ── Status (JSON) ──
-app.get('/status', (req, res) => {
-  res.json({ connected: isConnected, sent: sentCount, failed: failCount, queue: _queue.length });
+// ── home page: saare accounts + QR ──
+app.get('/', qrAuth, async (req, res) => {
+  let h = '<h1>WhatsApp Gateway — Multi Account</h1>';
+  h += '<p style="font-size:15px">Sent: <b>' + sentCount + '</b> | Failed: <b>' + failCount +
+       '</b> | Queue: <b>' + _queue.length + '</b> | Connected: <b>' +
+       liveAccounts().length + '/' + accounts.length + '</b></p>';
+  h += '<div style="display:flex;flex-wrap:wrap;gap:18px;justify-content:center;margin-top:16px">';
+  for (const acc of accounts) {
+    h += '<div style="border:1px solid #bbb;border-radius:12px;padding:16px;min-width:250px">';
+    h += '<h3>' + acc.id.toUpperCase() + '</h3>';
+    if (acc.connected) {
+      h += '<p style="color:green;font-size:16px">✅ Connected<br><b>' + acc.number + '</b></p>';
+    } else if (acc.qr) {
+      const img = await qrcode.toDataURL(acc.qr);
+      h += '<p>Scan to add number:</p><img src="' + img + '" style="width:230px;height:230px"/>';
+    } else {
+      h += '<p style="color:#999">Starting / waiting...</p>';
+    }
+    h += '</div>';
+  }
+  h += '</div><p style="color:#888;font-size:12px;margin-top:18px">Har 10s me refresh. Jitne number scan karoge utne se rotate hoga.</p>';
+  h += '<script>setTimeout(function(){location.reload()},10000)</script>';
+  res.send('<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>WA Gateway</title></head><body style="font-family:sans-serif;text-align:center;padding:30px">' + h + '</body></html>');
 });
 
-// ── Send (5s-gap queue me jaata hai) ──
+// ── status JSON ──
+app.get('/status', (req, res) => {
+  res.json({
+    sent: sentCount, failed: failCount, queue: _queue.length,
+    connected: liveAccounts().length, total: accounts.length,
+    accounts: accounts.map(function (a) { return { id: a.id, connected: a.connected, number: a.number }; }),
+  });
+});
+
+// ── send (rotation me jaata hai) ──
 app.post('/api/send', (req, res) => {
   if (req.headers['x-api-key'] !== API_KEY) {
     return res.status(401).json({ success: false, error: 'Invalid API key' });
   }
-  if (!isConnected) {
-    return res.status(503).json({ success: false, error: 'WhatsApp not connected' });
+  if (!liveAccounts().length) {
+    return res.status(503).json({ success: false, error: 'No WhatsApp account connected' });
   }
   let { number, message } = req.body || {};
   if (!number || !message) {
@@ -212,7 +214,9 @@ app.post('/api/send', (req, res) => {
   _queue.push({ number: number, message: message });
   _processQueue();
 
-  return res.json({ success: true, to: number, queued: true, position: _queue.length });
+  return res.json({ success: true, to: number, queued: true });
 });
 
-app.listen(PORT, () => console.log('Gateway running on port ' + PORT));
+app.listen(PORT, function () {
+  console.log('Multi-account Gateway on port ' + PORT + ' | accounts: ' + NUM_ACCOUNTS);
+});
