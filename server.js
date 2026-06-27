@@ -1,5 +1,5 @@
 // WhatsApp Gateway - QR login + REST API + 5s queue + counters
-// Baileys based (no browser needed). Always-on Node server par chalega.
+// Reliability fixes: getMessage store, msgRetryCounter cache, keepalive, presence.
 
 const express = require('express');
 const {
@@ -9,6 +9,7 @@ const {
   fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
+const NodeCache = require('node-cache');
 const qrcode = require('qrcode');
 const pino = require('pino');
 
@@ -20,8 +21,7 @@ const PORT = process.env.PORT || 3000;
 const AUTH_FOLDER = process.env.AUTH_FOLDER || 'auth_session';
 const SEND_GAP_MS = 5000; // har message ke beech 5 second (anti-ban)
 
-// ── QR/home page protection: browser me kholne par password maangega ──
-// Default password = API_KEY (alag chahiye to env me QR_PASS set karo)
+// â”€â”€ QR/home page protection: browser me kholne par password â”€â”€
 const QR_USER = process.env.QR_USER || 'admin';
 const QR_PASS = process.env.QR_PASS || API_KEY;
 function qrAuth(req, res, next) {
@@ -41,11 +41,14 @@ let sock;
 let currentQR = null;
 let isConnected = false;
 
-// ── Counters ──
 let sentCount = 0;
 let failCount = 0;
 
-// ── Message queue: 5s gap between sends ──
+// â”€â”€ reliability caches â”€â”€
+const msgRetryCounterCache = new NodeCache();      // message retry counts
+const sentMsgStore = new Map();                    // getMessage ke liye bheje hue messages
+
+// â”€â”€ Message queue: 5s gap â”€â”€
 let _queue = [];
 let _processing = false;
 
@@ -62,7 +65,15 @@ async function _processQueue() {
         failCount++;
         console.log('SKIP (not on WhatsApp): ' + job.number);
       } else {
-        await sock.sendMessage(jid, { text: job.message });
+        const sent = await sock.sendMessage(jid, { text: job.message });
+        // store for retry/getMessage
+        if (sent && sent.key && sent.key.id) {
+          sentMsgStore.set(sent.key.id, { conversation: job.message });
+          if (sentMsgStore.size > 300) { // purane saaf karo
+            const firstKey = sentMsgStore.keys().next().value;
+            sentMsgStore.delete(firstKey);
+          }
+        }
         sentCount++;
         console.log('SENT -> ' + job.number + ' | queue left: ' + _queue.length);
       }
@@ -85,6 +96,19 @@ async function startWhatsApp() {
     printQRInTerminal: false,
     logger: pino({ level: 'silent' }),
     browser: ['MyDigitalRegister', 'Chrome', '1.0.0'],
+    // â”€â”€ reliability settings (search-recommended) â”€â”€
+    msgRetryCounterCache,
+    markOnlineOnConnect: false,        // phone par notification aate rahein
+    keepAliveIntervalMs: 30000,        // connection zinda rakho
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    retryRequestDelayMs: 1000,
+    maxMsgRetryCount: 5,
+    syncFullHistory: false,
+    getMessage: async (key) => {       // retry/re-send ke liye zaroori
+      if (key && key.id && sentMsgStore.has(key.id)) return sentMsgStore.get(key.id);
+      return { conversation: '' };
+    },
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -95,6 +119,8 @@ async function startWhatsApp() {
     if (connection === 'open') {
       isConnected = true; currentQR = null;
       console.log('WhatsApp connected and ready.');
+      // online presence bhejo taaki messages flow karein
+      try { sock.sendPresenceUpdate('available'); } catch (e) {}
     }
     if (connection === 'close') {
       isConnected = false;
@@ -110,20 +136,20 @@ async function startWhatsApp() {
 
 startWhatsApp();
 
-// ── Home / QR / status page ──
+// â”€â”€ Home / QR / status page â”€â”€
 app.get('/', qrAuth, async (req, res) => {
-  const stats = '<p style="color:#444;font-size:15px">📤 Sent: <b>' + sentCount +
-    '</b> &nbsp;|&nbsp; ❌ Failed: <b>' + failCount +
-    '</b> &nbsp;|&nbsp; ⏳ Queue: <b>' + _queue.length + '</b></p>';
+  const stats = '<p style="color:#444;font-size:15px">ðŸ“¤ Sent: <b>' + sentCount +
+    '</b> &nbsp;|&nbsp; âŒ Failed: <b>' + failCount +
+    '</b> &nbsp;|&nbsp; â³ Queue: <b>' + _queue.length + '</b></p>';
   if (isConnected) {
-    return res.send(page('<h2>✅ WhatsApp Connected & Ready</h2>' + stats +
+    return res.send(page('<h2>âœ… WhatsApp Connected & Ready</h2>' + stats +
       '<script>setTimeout(function(){location.reload()},15000)</script>'));
   }
   if (currentQR) {
     const img = await qrcode.toDataURL(currentQR);
     return res.send(page(
       '<h2>Scan with WhatsApp</h2>' +
-      '<p>WhatsApp → Linked Devices → Link a Device</p>' +
+      '<p>WhatsApp â†’ Linked Devices â†’ Link a Device</p>' +
       '<img src="' + img + '" style="width:300px;height:300px"/>' +
       '<p><small>Page har 10s me refresh hoga</small></p>' +
       '<script>setTimeout(function(){location.reload()},10000)</script>'
@@ -139,12 +165,12 @@ function page(inner) {
     '<body style="font-family:sans-serif;text-align:center;padding:40px">' + inner + '</body></html>';
 }
 
-// ── Status (JSON) ──
+// â”€â”€ Status (JSON) â”€â”€
 app.get('/status', (req, res) => {
   res.json({ connected: isConnected, sent: sentCount, failed: failCount, queue: _queue.length });
 });
 
-// ── Send (5s-gap queue me jaata hai) ──
+// â”€â”€ Send (5s-gap queue me jaata hai) â”€â”€
 app.post('/api/send', (req, res) => {
   if (req.headers['x-api-key'] !== API_KEY) {
     return res.status(401).json({ success: false, error: 'Invalid API key' });
