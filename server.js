@@ -115,8 +115,15 @@ async function startAccount(acc) {
         ? lastDisconnect.error.output.statusCode : null;
       const loggedOut = code === DisconnectReason.loggedOut;
       console.log('[' + acc.id + '] closed. code=' + code + ' reconnect=' + !loggedOut);
-      if (!loggedOut) setTimeout(function () { startAccount(acc); }, 3000);
-      else console.log('[' + acc.id + '] logged out. Delete folder "' + acc.folder + '" & re-scan.');
+      if (!loggedOut) {
+        setTimeout(function () { startAccount(acc); }, 3000);
+      } else {
+        // logout hua → auth hatao + restart → naya QR khud aa jaayega (re-login dabane ki zaroorat nahi)
+        console.log('[' + acc.id + '] logged out — auto reset, naya QR aayega.');
+        try { fs.rmSync(acc.folder, { recursive: true, force: true }); } catch (e) {}
+        acc.qr = null; acc.number = '?';
+        setTimeout(function () { startAccount(acc); }, 2000);
+      }
     }
   });
 }
